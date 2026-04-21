@@ -591,9 +591,49 @@ bool IPlugAPPHost::InitAudio(uint32_t inID, uint32_t outID, uint32_t sr, uint32_
   iParams.nChannels = GetPlug()->MaxNChannels(ERoute::kInput); // TODO: flexible channel count
   iParams.firstChannel = 0; // TODO: flexible channel count
 
+  // Clamp requested input channels to what the device actually supports
+  {
+    auto inInfo = mDAC->getDeviceInfo(inID);
+    if (static_cast<int>(inInfo.inputChannels) < iParams.nChannels)
+      iParams.nChannels = inInfo.inputChannels;
+  }
+
   oParams.deviceId = outID;
   oParams.nChannels = GetPlug()->MaxNChannels(ERoute::kOutput); // TODO: flexible channel count
   oParams.firstChannel = 0; // TODO: flexible channel count
+
+  // Pick a sample rate both devices can support. Without this, a duplex
+  // stream fails when the input device (e.g. a Bluetooth headset mic at
+  // 16 kHz) doesn't support the output device's rate.
+  auto srSupportedBy = [](const RtAudio::DeviceInfo& info, uint32_t rate) {
+    for (auto r : info.sampleRates) if (r == rate) return true;
+    return false;
+  };
+  {
+    const auto outInfo = mDAC->getDeviceInfo(outID);
+    if (!srSupportedBy(outInfo, sr))
+    {
+      const uint32_t newSR = (outInfo.preferredSampleRate != 0) ? outInfo.preferredSampleRate
+                           : (!outInfo.sampleRates.empty() ? outInfo.sampleRates.back() : sr);
+      if (newSR != sr)
+      {
+        DBGMSG("output device doesn't support sr=%u, switching to %u\n", sr, newSR);
+        sr = newSR;
+      }
+    }
+    // If the input device can't handle the chosen SR, open output-only.
+    // For MIDI-effect-style plugins this is the common case on Macs where
+    // the default input is a Bluetooth headset mic with a limited rate list.
+    if (iParams.nChannels > 0)
+    {
+      const auto inInfo = mDAC->getDeviceInfo(inID);
+      if (!srSupportedBy(inInfo, sr))
+      {
+        DBGMSG("input device '%s' doesn't support sr=%u, opening output-only\n", inInfo.name.c_str(), sr);
+        iParams.nChannels = 0;
+      }
+    }
+  }
 
   mBufferSize = iovs; // mBufferSize may get changed by stream
 
@@ -623,15 +663,25 @@ bool IPlugAPPHost::InitAudio(uint32_t inID, uint32_t outID, uint32_t sr, uint32_
     return false;
   }
 
-  for (int i = 0; i < iParams.nChannels; i++)
-  {
-    mInputBufPtrs.Add(nullptr); //will be set in callback
-  }
-    
-  for (int i = 0; i < oParams.nChannels; i++)
-  {
-    mOutputBufPtrs.Add(nullptr); //will be set in callback
-  }
+  // Persist the actually-working SR so subsequent runs pick it up from INI.
+  mState.mAudioSR = sr;
+
+  // Track actually-opened channel counts so the callback doesn't write
+  // pointers into buffer slots that weren't allocated by RtAudio.
+  mNInputChansOpen = iParams.nChannels;
+  mNOutputChansOpen = oParams.nChannels;
+
+  // Size the pointer lists to MaxNChannels (not the clamped stream count)
+  // so plugin code can safely read inputs[0..Max-1]. Slots beyond the
+  // opened channels stay nullptr, which plugins already null-check.
+  mInputBufPtrs.Empty();
+  mOutputBufPtrs.Empty();
+  const int maxIn = GetPlug()->MaxNChannels(ERoute::kInput);
+  const int maxOut = GetPlug()->MaxNChannels(ERoute::kOutput);
+  for (int i = 0; i < maxIn; i++)
+    mInputBufPtrs.Add(nullptr); //will be set in callback (only up to mNInputChansOpen)
+  for (int i = 0; i < maxOut; i++)
+    mOutputBufPtrs.Add(nullptr); //will be set in callback (only up to mNOutputChansOpen)
     
   if (mDAC->startStream() != RTAUDIO_NO_ERROR)
   {
@@ -702,9 +752,12 @@ int IPlugAPPHost::AudioCallback(void* pOutputBuffer, void* pInputBuffer, uint32_
 {
   IPlugAPPHost* _this = (IPlugAPPHost*) pUserData;
 
-  int nins = _this->GetPlug()->MaxNChannels(ERoute::kInput);
-  int nouts = _this->GetPlug()->MaxNChannels(ERoute::kOutput);
-  
+  // Only iterate over channels that were actually opened on the stream.
+  // Slots beyond these remain nullptr in mInputBufPtrs/mOutputBufPtrs,
+  // which plugins null-check before dereferencing.
+  int nins = _this->mNInputChansOpen;
+  int nouts = _this->mNOutputChansOpen;
+
   double* pInputBufferD = static_cast<double*>(pInputBuffer);
   double* pOutputBufferD = static_cast<double*>(pOutputBuffer);
 

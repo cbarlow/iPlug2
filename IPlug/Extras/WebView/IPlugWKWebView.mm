@@ -57,39 +57,9 @@
 
 - (void)willOpenMenu:(NSMenu *)menu withEvent:(NSEvent *)event
 {
-  [super willOpenMenu:menu withEvent:event];
-  
-  NSArray<NSString *> *WKStrings = @[
-   @"WKMenuItemIdentifierCopy",
-   @"WKMenuItemIdentifierCopyImage",
-   @"WKMenuItemIdentifierCopyLink",
-   @"WKMenuItemIdentifierDownloadImage",
-   @"WKMenuItemIdentifierDownloadLinkedFile",
-   @"WKMenuItemIdentifierGoBack",
-   @"WKMenuItemIdentifierGoForward",
-//   @"WKMenuItemIdentifierInspectElement",
-   @"WKMenuItemIdentifierLookUp",
-   @"WKMenuItemIdentifierOpenFrameInNewWindow",
-   @"WKMenuItemIdentifierOpenImageInNewWindow",
-   @"WKMenuItemIdentifierOpenLink",
-   @"WKMenuItemIdentifierOpenLinkInNewWindow",
-   @"WKMenuItemIdentifierPaste",
-//   @"WKMenuItemIdentifierReload",
-   @"WKMenuItemIdentifierSearchWeb",
-   @"WKMenuItemIdentifierShowHideMediaControls",
-   @"WKMenuItemIdentifierToggleFullScreen",
-   @"WKMenuItemIdentifierTranslate",
-   @"WKMenuItemIdentifierShareMenu",
-   @"WKMenuItemIdentifierSpeechMenu"
-  ];
-  
-  for (NSInteger itemIndex = 0; itemIndex < menu.itemArray.count; itemIndex++)
-  {
-    if ([WKStrings containsObject:menu.itemArray[itemIndex].identifier])
-    {
-      [menu removeItemAtIndex:itemIndex];
-    }
-  }
+  // Suppress native context menu entirely so right-click events
+  // flow through to web content (pointerdown/contextmenu).
+  [menu removeAllItems];
 }
 
 #endif

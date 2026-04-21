@@ -271,6 +271,12 @@ private:
   
   WDL_PtrList<double> mInputBufPtrs;
   WDL_PtrList<double> mOutputBufPtrs;
+  /** Number of audio input/output channels actually opened on the stream
+   *  (may be less than MaxNChannels if the device has fewer channels).
+   *  Used to avoid writing pointers past the opened buffer, which would
+   *  leave garbage in unset slots of mInputBufPtrs/mOutputBufPtrs. */
+  int mNInputChansOpen = 0;
+  int mNOutputChansOpen = 0;
   
   friend class IPlugAPP;
 };
