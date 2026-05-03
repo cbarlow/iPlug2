@@ -409,7 +409,11 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
         menu = SWELL_DuplicateMenu(menu);
         HMENU src = LoadMenu(NULL, MAKEINTRESOURCE(IDR_MENU1));
 
-        for (int x = 0; x < GetMenuItemCount(src)-1; x++)
+        // Iterate every popup in IDR_MENU1. Upstream iPlug2 had
+        // GetMenuItemCount(src)-1 here, which silently dropped the last
+        // popup -- making any Help menu defined in main.rc invisible on
+        // macOS standalone builds. Removed -1 so File/Debug/Help all import.
+        for (int x = 0; x < GetMenuItemCount(src); x++)
         {
           HMENU sm = GetSubMenu(src,x);
           
