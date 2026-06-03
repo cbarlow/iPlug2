@@ -33,7 +33,10 @@
 #include <windows.h>
 #include <wininet.h>
 #include <shlobj.h>
+#include <shlwapi.h>      // SHRAPNEL: SHCreateMemStream for WebResourceRequested response bodies
 #include <cassert>
+#include <vector>
+#include <string>
 
 #include <wrl.h>
 #include <wil/com.h>
@@ -89,6 +92,7 @@ private:
   EventRegistrationToken mDownloadStartingToken;
   EventRegistrationToken mBytesReceivedChangedToken;
   EventRegistrationToken mStateChangedToken;
+  EventRegistrationToken mWebResourceRequestedToken{};
   bool mShowOnLoad = true;
   WDL_String mWebRoot;
   RECT mWebViewBounds;
@@ -109,9 +113,20 @@ IWebViewImpl::~IWebViewImpl()
   CloseWebView();
 }
 
-void* IWebViewImpl::OpenWebView(void* pParent, float,float,float,float,float)
+void* IWebViewImpl::OpenWebView(void* pParent, float x, float y, float w, float h, float scale)
 {
   mParentWnd = (HWND)pParent;
+
+  // ── SHRAPNEL PATCH (fixes blank CLAP WebView on Windows) ────────────────
+  // Initialize the bounds rect from the editor dimensions. The WebView2
+  // controller is created asynchronously and its completion callback calls
+  // put_Bounds(mWebViewBounds) right after the controller exists. Without
+  // this, mWebViewBounds is an uninitialized RECT and the WebView paints
+  // to a garbage / zero rect. VST3 hosts happen to call OnParentWindowResize
+  // before show, which fixes things up — CLAP hosts (e.g. Reaper) don't, so
+  // the window stays blank for the lifetime of the editor.
+  mWebViewBounds = GetScaledRect(x, y, w, h, GetScaleForHWND(mParentWnd));
+  // ──────────────────────────────────────────────────────────────────────
 
   WDL_String cachePath;
   WebViewCachePath(cachePath);
@@ -124,6 +139,34 @@ void* IWebViewImpl::OpenWebView(void* pParent, float,float,float,float,float)
   options->put_ExclusiveUserDataFolderAccess(FALSE);
   // options->put_Language(m_language.c_str());
   options->put_IsCustomCrashReportingEnabled(FALSE);
+
+  // ── SHRAPNEL CUSTOMIZATION (in-memory custom-scheme handler) ──────────
+  // If a custom URL scheme is set, register it with the WebView2 environment
+  // so the WebResourceRequested filter we install later can intercept
+  // requests to that scheme. Without this registration WebView2 refuses to
+  // navigate to / fetch URLs using the scheme.
+  //
+  // TreatAsSecure makes the scheme behave like https for mixed-content rules
+  // (otherwise an HTML page loaded via NavigateToString — which has the
+  // opaque/about:blank origin — can't fetch our scheme). AllowedOrigins is
+  // set to "*" so the null/opaque origin from NavigateToString can fetch.
+  const char* customScheme = mIWebView->GetCustomUrlScheme();
+  if (customScheme && customScheme[0])
+  {
+    std::wstring schemeWide(customScheme, customScheme + strlen(customScheme));
+    auto reg = Make<CoreWebView2CustomSchemeRegistration>(schemeWide.c_str());
+    reg->put_TreatAsSecure(TRUE);
+    reg->put_HasAuthorityComponent(TRUE);
+    LPCWSTR allowedOrigins[] = { L"*" };
+    reg->SetAllowedOrigins(1, allowedOrigins);
+    ICoreWebView2CustomSchemeRegistration* regs[] = { reg.Get() };
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions4> options4;
+    if (SUCCEEDED(options.As(&options4)) && options4)
+    {
+      options4->SetCustomSchemeRegistrations(1, regs);
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────
 
   CreateCoreWebView2EnvironmentWithOptions(
     nullptr, cachePathWide.data(), options.Get(),
@@ -356,6 +399,75 @@ void* IWebViewImpl::OpenWebView(void* pParent, float,float,float,float,float)
               memset(&color, 0, sizeof(COREWEBVIEW2_COLOR));
               controller2->put_DefaultBackgroundColor(color);
             }
+
+            // ── SHRAPNEL CUSTOMIZATION (in-memory custom-scheme handler) ──
+            // Hook WebResourceRequested for "<scheme>://*" so the derived
+            // IWebView can serve binary assets from in-memory byte arrays.
+            // The filter MUST be installed before NavigateToString is called
+            // (which happens in OnWebViewReady's mEditorInitFunc), so this
+            // sits right before that callback.
+            const char* schemeCStr = mIWebView->GetCustomUrlScheme();
+            if (schemeCStr && schemeCStr[0])
+            {
+              std::wstring schemeW(schemeCStr, schemeCStr + strlen(schemeCStr));
+              std::wstring filter = schemeW + L"://*";
+              mCoreWebView->AddWebResourceRequestedFilter(filter.c_str(),
+                                                         COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+
+              mCoreWebView->add_WebResourceRequested(
+                Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+                  [this](ICoreWebView2* sender,
+                         ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+                    wil::com_ptr<ICoreWebView2WebResourceRequest> request;
+                    args->get_Request(&request);
+                    wil::unique_cotaskmem_string uriW;
+                    request->get_Uri(&uriW);
+                    WDL_String uriU8;
+                    UTF16ToUTF8(uriU8, uriW.get());
+
+                    std::vector<uint8_t> data;
+                    std::string mime;
+                    bool handled = mIWebView->OnLoadCustomScheme(uriU8.Get(), data, mime);
+
+                    wil::com_ptr<ICoreWebView2Environment> env = mWebViewEnvironment;
+                    if (!env) return S_OK;
+
+                    wil::com_ptr<IStream> stream;
+                    int statusCode = 404;
+                    const char* statusText = "Not Found";
+                    if (handled && !data.empty())
+                    {
+                      stream.attach(::SHCreateMemStream(data.data(),
+                                                       static_cast<UINT>(data.size())));
+                      statusCode = 200;
+                      statusText = "OK";
+                    }
+
+                    std::wstring headerW;
+                    if (handled)
+                    {
+                      WDL_String h;
+                      h.SetFormatted(256,
+                        "Content-Type: %s\r\nAccess-Control-Allow-Origin: *",
+                        mime.empty() ? "application/octet-stream" : mime.c_str());
+                      int sz = UTF8ToUTF16Len(h.Get());
+                      std::vector<WCHAR> buf(sz);
+                      UTF8ToUTF16(buf.data(), h.Get(), sz);
+                      headerW.assign(buf.data());
+                    }
+
+                    std::wstring statusW(statusText, statusText + strlen(statusText));
+                    wil::com_ptr<ICoreWebView2WebResourceResponse> response;
+                    env->CreateWebResourceResponse(stream.get(), statusCode,
+                                                   statusW.c_str(),
+                                                   handled ? headerW.c_str() : L"",
+                                                   &response);
+                    args->put_Response(response.get());
+                    return S_OK;
+                  }).Get(),
+                &mWebResourceRequestedToken);
+            }
+            // ──────────────────────────────────────────────────────────────
 
             mWebViewCtrlr->put_Bounds(mWebViewBounds);
             mIWebView->OnWebViewReady();

@@ -29,6 +29,9 @@
 
 #import "IPlugWKWebViewScriptMessageHandler.h"
 #include "IPlugWebView.h"
+#include <vector>
+#include <string>
+#include <cstdint>
 
 #if !__has_feature(objc_arc)
 #error This file must be compiled with Arc. Use -fobjc-arc flag
@@ -75,14 +78,49 @@ using namespace iplug;
 
   NSString* customUrlScheme = [NSString stringWithUTF8String:mIWebView->GetCustomUrlScheme()];
   const BOOL useCustomUrlScheme = [customUrlScheme length];
-  
+
+  // ── SHRAPNEL CUSTOMIZATION (in-memory custom-scheme handler) ──────────
+  // Give the derived IWebView a chance to serve the request from in-memory
+  // bytes before falling back to disk-backed lookup below. This is how the
+  // Shrapnel plugin ships its large background JPGs inside the binary
+  // instead of inlining base64 into the HTML (which would blow the 2 MB
+  // NavigateToString cap on Windows, and is also slower to parse on macOS).
+  if (useCustomUrlScheme)
+  {
+    NSURL* reqURL = urlSchemeTask.request.URL;
+    const char* urlCStr = [[reqURL absoluteString] UTF8String];
+    if (urlCStr)
+    {
+      std::vector<uint8_t> data;
+      std::string mime;
+      if (mIWebView->OnLoadCustomScheme(urlCStr, data, mime))
+      {
+        NSString* mimeStr = [NSString stringWithUTF8String:mime.empty() ? "application/octet-stream" : mime.c_str()];
+        NSString* lenStr = [NSString stringWithFormat:@"%lu", (unsigned long)data.size()];
+        NSDictionary* headers = @{ @"Content-Type": mimeStr,
+                                   @"Content-Length": lenStr,
+                                   @"Access-Control-Allow-Origin": @"*" };
+        NSHTTPURLResponse* response = [[NSHTTPURLResponse alloc] initWithURL:reqURL
+                                                                  statusCode:200
+                                                                 HTTPVersion:@"HTTP/1.1"
+                                                                headerFields:headers];
+        NSData* respData = [NSData dataWithBytes:data.data() length:data.size()];
+        [urlSchemeTask didReceiveResponse:response];
+        [urlSchemeTask didReceiveData:respData];
+        [urlSchemeTask didFinish];
+        return;
+      }
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────
+
   NSString* urlScheme = @"file:";
-  
+
   if (useCustomUrlScheme)
   {
     urlScheme = [urlScheme stringByReplacingOccurrencesOfString:@"file" withString:customUrlScheme];
   }
-  
+
   if (useCustomUrlScheme && [urlSchemeTask.request.URL.absoluteString containsString: urlScheme])
   {
     NSURL* customFileURL = urlSchemeTask.request.URL;

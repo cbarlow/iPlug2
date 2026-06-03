@@ -34,6 +34,9 @@
 #include "wdlstring.h"
 #include <functional>
 #include <memory>
+#include <cstdint>
+#include <vector>
+#include <string>
 
 BEGIN_IPLUG_NAMESPACE
 
@@ -132,6 +135,22 @@ public:
 
   /** Override to handle file download progress */
   virtual void OnReceivedData(size_t numBytesReceived, size_t totalNumBytes) {}
+
+  // ── SHRAPNEL CUSTOMIZATION (in-memory custom-scheme handler) ──────────
+  // Allows derived classes to serve binary assets in response to requests
+  // for the custom URL scheme. Returning true with bytes filled marks the
+  // request as handled; returning false lets the platform impl fall back
+  // to its default behaviour (e.g. disk-backed file lookup on macOS, or
+  // a 404 on Windows).
+  //
+  // `url` is the full request URL (e.g. "shrapnel://assets/foo.jpg").
+  // `outData` should be replaced with the response bytes. `outMimeType`
+  // should be set to the Content-Type to return. This is called from the
+  // WebView's UI thread on both Windows and macOS.
+  virtual bool OnLoadCustomScheme(const char* url,
+                                  std::vector<uint8_t>& outData,
+                                  std::string& outMimeType) { return false; }
+  // ──────────────────────────────────────────────────────────────────────
 
 private:
   std::unique_ptr<IWebViewImpl> mpImpl;
